@@ -303,43 +303,58 @@ std::optional<PathWithLaneId> PathGenerator::generate_path(
     forward_lanelets_length += lanelet::geometry::length2d(next_lanelets.front());
   }
 
-  const auto s = s_on_current_lanelet + backward_lanelets_length;
-  const auto s_start = std::max(0., s - params.path_length.backward);
+  const auto s_ego = s_ego_on_current_lanelet + backward_lanelets_length;
+  const auto s_start = std::max(0., s_ego - params.path_length.backward);
+  auto s_end = s_ego + params.path_length.forward;
+
+  if (!utils::get_next_lanelet_within_route(lanelets.back(), planner_data_)) {
+    s_end = std::min(s_end, lanelet::geometry::length2d(lanelet::LaneletSequence(lanelets)));
+  }
 
   std::optional<lanelet::ConstLanelet> goal_lanelet_for_path = std::nullopt;
-  const auto s_end = [&]() {
-    auto s_end = s + params.path_length.forward;
-
-    if (!utils::get_next_lanelet_within_route(lanelets.back(), planner_data_)) {
-      s_end = std::min(s_end, lanelet::utils::getLaneletLength2d(lanelets));
+  std::optional<double> s_goal_position = std::nullopt;
+  for (auto [it, s] = std::make_tuple(lanelets.begin(), 0.); it != lanelets.end(); ++it) {
+    const auto & lane_id = it->id();
+    if (std::any_of(lanelets.begin(), it, [lane_id](const lanelet::ConstLanelet & lanelet) {
+          return lane_id == lanelet.id();
+        })) {
+      RCLCPP_WARN(get_logger(), "Loop detected: %ld", lane_id);
+      lanelets.erase(it, lanelets.end());
+      s_end = s;
+      break;
     }
-
-    const auto s_intersection = utils::get_first_intersection_arc_length(
-      lanelets, std::max(0., s_start - vehicle_info_.max_longitudinal_offset_m),
-      s_end + vehicle_info_.max_longitudinal_offset_m, vehicle_info_.vehicle_length_m);
-    if (s_intersection) {
-      s_end =
-        std::min(s_end, std::max(0., *s_intersection - vehicle_info_.max_longitudinal_offset_m));
-    }
-
-    for (auto [it, s_goal] = std::make_tuple(lanelets.begin(), 0.); it != lanelets.end(); ++it) {
-      if (std::any_of(
-            planner_data_.goal_lanelets.begin(), planner_data_.goal_lanelets.end(),
-            [id = it->id()](const auto & goal_lanelet) { return id == goal_lanelet.id(); })) {
-        s_goal += lanelet::utils::getArcCoordinates({*it}, planner_data_.goal_pose).length;
-        if (s_goal < s_end) {
-          goal_lanelet_for_path = *it;
-          s_end = s_goal;
-        }
-        break;
+    if (std::any_of(
+          planner_data_.goal_lanelets.begin(), planner_data_.goal_lanelets.end(),
+          [lane_id](const auto & goal_lanelet) { return lane_id == goal_lanelet.id(); })) {
+      const auto s_goal =
+        s + lanelet::utils::getArcCoordinates({*it}, planner_data_.goal_pose).length;
+      if (s_goal < s_end) {
+        goal_lanelet_for_path = *it;
+        s_goal_position = s_goal;
+        s_end = s_goal;
       }
-      s_goal += lanelet::geometry::length2d(*it);
     }
+    s += lanelet::geometry::length2d(*it);
+    if (s >= s_end + vehicle_info_.max_longitudinal_offset_m) {
+      lanelets.erase(std::next(it), lanelets.end());
+      break;
+    }
+  }
 
-    return s_end;
-  }();
+  const auto s_intersection = utils::get_first_intersection_arc_length(
+    lanelets, std::max(0., s_start - vehicle_info_.max_longitudinal_offset_m),
+    s_end + vehicle_info_.max_longitudinal_offset_m, vehicle_info_.vehicle_length_m);
+  if (s_intersection) {
+    s_end =
+      std::min(s_end, std::max(0., *s_intersection - vehicle_info_.max_longitudinal_offset_m));
+    // If s_end is cut before goal position, clear goal_lanelet_for_path
+    if (s_goal_position && s_end < *s_goal_position) {
+      goal_lanelet_for_path = std::nullopt;
+    }
+  }
 
-  return generate_path(lanelets, s_start, s_end, goal_lanelet_for_path, params);
+  return generate_path(
+    lanelets, current_lanelet, current_pose, s_ego, s_start, s_end, goal_lanelet_for_path, params);
 }
 
 std::optional<PathWithLaneId> PathGenerator::generate_path(
